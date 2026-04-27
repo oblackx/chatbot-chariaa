@@ -1,14 +1,13 @@
-from typing import TypedDict, List, Optional, Annotated
-from langgraph.graph.message import add_messages
+"""
+graph/state.py — État partagé du graphe LangGraph.
+"""
+
+import operator
+from typing import Annotated, Optional
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage
 
 class AgentState(TypedDict):
     question: str
-    question_embedding: List[float]
-    intent: str
-    next_agent: str
-    retrieved_context: str
-    sources: list
-    answer: Optional[str]
-    session_id: str
-    messages: Annotated[list, add_messages]
-    error: Optional[str]
+    messages: Annotated[list[BaseMessage], operator.add]
+    destination: Optional[str]
