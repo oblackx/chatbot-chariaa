@@ -1,3 +1,7 @@
+"""
+rag/database.py — Connexion PostgreSQL et création de la table vectorielle.
+"""
+
 import os
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -6,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_connection():
+    """Retourne une connexion à PostgreSQL avec le support du type VECTOR."""
     conn = psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -17,8 +22,10 @@ def get_connection():
     return conn
 
 def create_tables():
+    """Crée la table document_chunks et active l'extension pgvector si nécessaire."""
     conn = get_connection()
     cur = conn.cursor()
+
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
@@ -28,7 +35,11 @@ def create_tables():
             embedding VECTOR(768)
         );
     """)
+
     conn.commit()
     cur.close()
     conn.close()
-    print("Tables créées avec succès !")
+    print("✅ Tables prêtes (document_chunks).")
+
+if __name__ == "__main__":
+    create_tables()
