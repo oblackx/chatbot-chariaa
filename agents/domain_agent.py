@@ -1,49 +1,50 @@
-from langchain_ollama import ChatOllama  # Importe le client ChatOllama pour le modèle de langage
-from langgraph.prebuilt import create_react_agent  # Importe la fonction de création d'agent React
-from agents.tools import search_documents  # Importe l'outil de recherche de documents
+"""
+agents/domain_agent.py — Agents spécialisés Coran et Hadith.
 
-def create_quran_agent():  # Définit l'agent spécialisé dans les questions sur le Coran
-    llm = ChatOllama(model="qwen3:8b", temperature=0)  # Crée une instance du modèle Ollama avec température nulle
-    tools = [search_documents]  # Définit la liste des outils disponibles pour l'agent
-    
-    system_prompt = """  
-    Tu es un expert du Coran, spécialisé dans les versets et les sourates.
-    Ta mission est de répondre aux questions des étudiants sur le Coran en te basant EXCLUSIVEMENT sur les résultats de l'outil 'search_documents'.
+RAG Pipeline : recherche vectorielle -> formatage contexte -> génération LLM.
+"""
 
-    RÈGLES STRICTES :
-    1. Utilise OBLIGATOIREMENT l'outil 'search_documents' pour chaque question.
-    2. Si l'outil ne trouve rien, réponds : "Désolé, je n'ai pas trouvé cette information dans les sources coraniques disponibles. Veuillez contacter l'administration."
-    3. N'invente JAMAIS de verset ou d'interprétation. N'utilise PAS tes connaissances générales.
-    4. Réponds en arabe ou en français selon la langue de la question.
-    5. Sois respectueux et précis.
-    """  # Fin du prompt système
-    
-    agent = create_react_agent(  # Crée l'agent avec le modèle, les outils et le prompt fourni
-        model=llm,
-        tools=tools,
-        prompt=system_prompt
-    )
-    return agent  # Retourne l'agent Coranique
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage
+from rag.retriever import retrieve_context, format_context_for_prompt
 
-def create_hadith_agent():  # Définit l'agent spécialisé dans les questions sur les hadiths
-    llm = ChatOllama(model="qwen3:8b", temperature=0)  # Crée une instance du modèle Ollama avec température nulle
-    tools = [search_documents]  # Définit la liste des outils disponibles pour l'agent
-    
-    system_prompt = """ 
-    Tu es un expert en hadiths du Prophète Muhammad (que la paix soit sur lui).
-    Ta mission est de répondre aux questions des étudiants sur les hadiths en te basant EXCLUSIVEMENT sur les résultats de l'outil 'search_documents'.
+_QURAN_SYSTEM = """\
+Tu es un assistant spécialisé en sciences coraniques pour les étudiants de la Faculté de Charia.
 
-    RÈGLES STRICTES :
-    1. Utilise OBLIGATOIREMENT l'outil 'search_documents' pour chaque question.
-    2. Si l'outil ne trouve rien, réponds : "Désolé, je n'ai pas trouvé ce hadith dans les sources disponibles. Veuillez contacter l'administration."
-    3. N'invente JAMAIS de hadith ou de chaîne de transmission. N'utilise PAS tes connaissances générales.
-    4. Réponds en arabe ou en français selon la langue de la question.
-    5. Mentionne la source si elle est disponible dans les résultats.
-    """  # Fin du prompt système
-    
-    agent = create_react_agent(  # Crée l'agent avec le modèle, les outils et le prompt fourni
-        model=llm,
-        tools=tools,
-        prompt=system_prompt
-    )
-    return agent  # Retourne l'agent Hadith
+RÈGLES STRICTES :
+1. Tu te bases UNIQUEMENT sur les versets fournis dans le CONTEXTE ci‑dessous.
+2. Tu cites TOUJOURS la référence EXACTE affichée (ex: الفاتحة [1:1]).
+   N'invente JAMAIS de sourate ou de numéro de verset.
+3. **N'invente ni ne suggère JAMAIS un verset ou une sourate qui n'est pas dans le contexte,
+   même pour aider l'étudiant. Contente-toi de ce que le contexte fournit.**
+4. Si le contexte ne contient pas de réponse, dis simplement :
+   "Les versets disponibles dans ma base ne permettent pas de répondre à cette question."
+   Sans ajouter d'exemples ni de suggestions.
+5. Réponds dans la même langue que l'étudiant.
+
+CONTEXTE :
+{context}
+"""
+
+def _get_llm():
+    return ChatOllama(model="qwen3:8b", temperature=0.1)
+
+def run_quran_agent(question: str) -> str:
+    results = retrieve_context(question, k=5)
+    context = format_context_for_prompt(results)
+    llm = _get_llm()
+    response = llm.invoke([
+        SystemMessage(content=_QURAN_SYSTEM.format(context=context)),
+        HumanMessage(content=question),
+    ])
+    return response.content
+
+def run_hadith_agent(question: str) -> str:
+    results = retrieve_context(question, k=5)
+    context = format_context_for_prompt(results)
+    llm = _get_llm()
+    response = llm.invoke([
+        SystemMessage(content=_HADITH_SYSTEM.format(context=context)),
+        HumanMessage(content=question),
+    ])
+    return response.content
