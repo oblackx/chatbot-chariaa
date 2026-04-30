@@ -1,29 +1,53 @@
 ﻿"""
 agents/domain_agent.py
 
-- run_quran_agent   : recherche DB uniquement, zéro hallucination
-- run_hadith_agent  : idem
-- run_conversation_agent : LLM libre (salutations, faits généraux, Darija)
+- run_quran_agent        : recherche Coran (pgvector + exact), zéro hallucination
+- run_hadith_agent       : recherche Bukhari (pgvector + exact), zéro hallucination
+- run_conversation_agent : LLM libre (salutations, Darija, faits généraux)
 """
 
 import re
+import json
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
-from rag.retriever import retrieve_context
+from rag.database import get_connection
+from rag.embeddings import get_embed_model
+
+def _is_arabic(text: str) -> bool:
+    """Détecte si le texte contient principalement des caractères arabes."""
+    arabic_re = re.compile(r'[\u0600-\u06FF]')
+    arabic_chars = len(arabic_re.findall(text))
+    return arabic_chars > len(text) * 0.3
 
 MIN_RELEVANCE_SCORE = 0.40
 
-_NO_RESULT = (
+_NO_RESULT_QURAN = (
     "لم أجد في قاعدة البيانات آيات مرتبطة بهذا السؤال.\n"
     "Les versets disponibles dans ma base ne permettent pas de répondre à cette question."
+)
+_NO_RESULT_HADITH = (
+    "لم أجد في قاعدة البيانات أحاديث مرتبطة بهذا السؤال.\n"
+    "Les hadiths disponibles dans ma base ne permettent pas de répondre à cette question."
 )
 
 
 # ---------------------------------------------------------------------------
-# Extraction de mots-clés arabes (recherche exacte normalisée)
+# Utilitaires communs
 # ---------------------------------------------------------------------------
 
-_KEYWORDS_PROMPT = """\
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _best_score(results: list[dict]) -> float:
+    return max((r["similarity"] for r in results), default=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Extraction de mots-clés arabes (Coran ou Hadith)
+# ---------------------------------------------------------------------------
+
+_KEYWORDS_PROMPT_QURAN = """\
 أنت خبير في اللغة العربية ومتخصص في الألفاظ القرآنية.
 
 السؤال : {question}
@@ -37,12 +61,28 @@ _KEYWORDS_PROMPT = """\
 أعطني من 3 إلى 5 مصطلحات فقط، كل واحد في سطر منفصل.
 بدون ترقيم، بدون شرح، بدون أي كلام آخر."""
 
+_KEYWORDS_PROMPT_HADITH = """\
+أنت خبير في علوم الحديث النبوي.
 
-def _extract_arabic_keywords(question: str) -> list[str]:
+السؤال : {question}
+
+مهمتك :
+1. حدد الجذر العربي للمفهوم الرئيسي في السؤال.
+2. اذكر الألفاظ التي تظهر في متون الأحاديث النبوية للتعبير عن هذا المفهوم
+   (بدون تشكيل، كما تظهر في كتب الحديث).
+3. اذكر الفعل أو الاسم الأكثر ورودًا في كتب الحديث.
+
+أعطني من 3 إلى 5 مصطلحات فقط، كل واحد في سطر منفصل.
+بدون ترقيم، بدون شرح، بدون أي كلام آخر."""
+
+
+def _extract_keywords(question: str, domain: str = "quran") -> list[str]:
+    """Extrait les mots-clés arabes selon le domaine (quran/hadith)."""
     llm = ChatOllama(model="qwen3:8b", temperature=0)
+    prompt_tpl = _KEYWORDS_PROMPT_QURAN if domain == "quran" else _KEYWORDS_PROMPT_HADITH
     try:
-        response = llm.invoke(_KEYWORDS_PROMPT.format(question=question))
-        content = re.sub(r"<think>.*?</think>", "", response.content, flags=re.DOTALL).strip()
+        response = llm.invoke(prompt_tpl.format(question=question))
+        content = _strip_think(response.content)
         terms = [
             line.strip().strip("\"'''\"«»،.-–—0123456789.")
             for line in content.splitlines() if line.strip()
@@ -53,34 +93,97 @@ def _extract_arabic_keywords(question: str) -> list[str]:
         return []
 
 
-def _best_score(results: list[dict]) -> float:
-    return max((r["similarity"] for r in results), default=0.0)
+# ---------------------------------------------------------------------------
+# Recherche dans PostgreSQL (source filtrée)
+# ---------------------------------------------------------------------------
 
+def _retrieve(
+    query: str,
+    source: str,           # 'quran' ou 'bukhari'
+    k: int = 15,
+    keywords: list[str] | None = None,
+) -> list[dict]:
+    """
+    Recherche hybride filtrée par source :
+    - Sémantique  : pgvector cosinus sur la question complète
+    - Exacte      : normalize_arabic LIKE sur chaque mot-clé
+    Fusion : meilleur score par contenu.
+    """
+    embed_model = get_embed_model()
+    query_vector = embed_model.embed_query(query)
+    search_terms = keywords if keywords else [query]
 
-def _strip_think(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            # 1. Sémantique filtré par source
+            cur.execute(
+                """
+                SELECT content, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM document_chunks
+                WHERE metadata->>'source' = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (query_vector, source, query_vector, k),
+            )
+            semantic_rows = cur.fetchall()
+
+            # 2. Exact normalisé filtré par source
+            exact_rows: list[tuple] = []
+            for term in search_terms:
+                if not term or not term.strip():
+                    continue
+                cur.execute(
+                    """
+                    SELECT content, metadata, 1.0 AS similarity
+                    FROM document_chunks
+                    WHERE metadata->>'source' = %s
+                      AND normalize_arabic(content)
+                          LIKE '%%' || normalize_arabic(%s) || '%%'
+                    LIMIT %s
+                    """,
+                    (source, term, k),
+                )
+                exact_rows.extend(cur.fetchall())
+    finally:
+        conn.close()
+
+    # Fusion
+    combined: dict[str, dict] = {}
+    for content, metadata, similarity in semantic_rows + exact_rows:
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        sim = round(float(similarity), 4)
+        if content not in combined or sim > combined[content]["similarity"]:
+            combined[content] = {
+                "content": content,
+                "metadata": metadata or {},
+                "similarity": sim,
+            }
+
+    return sorted(combined.values(), key=lambda x: x["similarity"], reverse=True)[:k]
 
 
 # ---------------------------------------------------------------------------
-# Agent Coran — DB uniquement, zéro LLM de génération
+# Agent Coran
 # ---------------------------------------------------------------------------
 
 def run_quran_agent(question: str) -> str:
-    keywords = _extract_arabic_keywords(question)
-    results = retrieve_context(question, k=20, keywords=keywords if keywords else None)
+    keywords = _extract_keywords(question, domain="quran")
+    results  = _retrieve(question, source="quran", k=20, keywords=keywords or None)
 
     if _best_score(results) < MIN_RELEVANCE_SCORE:
-        return _NO_RESULT
+        return _NO_RESULT_QURAN
 
     lines = ["📖 **Versets trouvés dans la base :**\n"]
     for i, r in enumerate(results, 1):
-        m = r["metadata"]
-        ref = (f"{m.get('sourate_nom','?')} "
-               f"[{m.get('sourate','?')}:{m.get('verset','?')}]")
+        m     = r["metadata"]
+        ref   = f"{m.get('sourate_nom','?')} [{m.get('sourate','?')}:{m.get('verset','?')}]"
         if m.get("lieu"):
             ref += f" — {m['lieu']}"
         score = r["similarity"]
-        # Distinguer visuellement les matches exacts des matches sémantiques
         badge = "🔵" if score >= 1.0 else "🟡"
         lines.append(f"{badge} **{i}. {ref}** (score : {score:.2f})")
         lines.append(f"> {r['content']}")
@@ -94,15 +197,55 @@ def run_quran_agent(question: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agent Hadith
+# Agent Hadith (Bukhari)
 # ---------------------------------------------------------------------------
 
 def run_hadith_agent(question: str) -> str:
-    return "⚙️ Les hadiths ne sont pas encore disponibles dans la base."
+    keywords = _extract_keywords(question, domain="hadith")
+    results  = _retrieve(question, source="bukhari", k=5, keywords=keywords or None)
+
+    if _best_score(results) < MIN_RELEVANCE_SCORE:
+        return _NO_RESULT_HADITH
+
+    lines = ["📚 **Hadiths trouvés dans la base (Sahih Bukhari) :**\n"]
+    for i, r in enumerate(results, 1):
+        m     = r["metadata"]
+        num   = m.get("hadith_number", "?")
+        chap  = m.get("chapter_arabic", "")
+        sec   = m.get("section_arabic", "")
+        grade = m.get("grade_arabic", "")
+        score = r["similarity"]
+        badge = "🔵" if score >= 1.0 else "🟡"
+
+        ref = f"حديث رقم {num}"
+        if chap:
+            ref += f" — {chap}"
+        if grade:
+            ref += f" ({grade})"
+
+        lines.append(f"{badge} **{i}. {ref}** (score : {score:.2f})")
+        if sec:
+            lines.append(f"*{sec}*")
+
+        # Isnad (chaîne de transmission) — affiché en petit
+        isnad = m.get("isnad_arabic", "")
+        if isnad:
+            lines.append(f"<small>*السند :* {isnad[:120]}…</small>")
+
+        # Matn (texte du hadith)
+        content_display = r['content'][:500] + ("…" if len(r['content']) > 500 else "")
+        lines.append(f"> {content_display}")
+        lines.append("")
+
+    if keywords:
+        lines.append(f"---\n*Mots-clés utilisés : {', '.join(keywords)}*")
+    lines.append("\n⚠️ *Ces hadiths sont fournis sans interprétation. "
+                 "Consultez un enseignant pour les vérifications.*")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Agent Conversation — LLM libre (salutations, Darija, faits généraux)
+# Agent Conversation
 # ---------------------------------------------------------------------------
 
 _CONVERSATION_SYSTEM = """\
@@ -114,7 +257,7 @@ _CONVERSATION_SYSTEM = """\
    - عدد سور القرآن (114 سورة)
    - عدد آيات القرآن (6236 آية في المصحف العثماني)
    - أسماء الأنبياء، أركان الإسلام، تعريفات بسيطة...
-3. للأسئلة التي تحتاج بحثاً في الآيات، تقول :
+3. للأسئلة التي تحتاج بحثاً في الآيات أو الأحاديث، تقول :
    "اكتب سؤالك بشكل كامل وسأبحث لك في قاعدة البيانات."
 4. تجيب بنفس لغة المستخدم، بإيجاز ولطف.
 5. لا تخترع آيات أو أحاديث.
