@@ -101,7 +101,7 @@ def build_metadata(h: dict) -> dict:
         "isnad_arabic":     clean(h.get("Arabic_Isnad")),
         "matn_english":     clean(h.get("English_Matn")),
         "grade_arabic":     clean(h.get("Arabic_Grade")),
-        "grade_english":    clean(h.get("English_Grade")),
+        "grade_englifgsh":    clean(h.get("English_Grade")),
     }
 
 
