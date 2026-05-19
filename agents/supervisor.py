@@ -1,5 +1,6 @@
 """
-agents/supervisor.py — Route vers : 'quran', 'hadith', ou 'conversation'.
+agents/supervisor.py
+Modèle : qwen3:8b — précision de routage multilingue (fr/ar/darija).
 """
 
 import re
@@ -7,31 +8,40 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 _SUPERVISOR_PROMPT = """\
-أنت موجّه ذكي لروبوت محادثة خاص بكلية الشريعة. مهمتك تصنيف الرسائل فقط.
+أنت موجّه لروبوت محادثة خاص بكلية الشريعة. مهمتك الوحيدة : تصنيف الرسالة.
 
-يُرسل المستخدمون رسائل بالعربية الفصحى أو الفرنسية أو الدارجة المغربية أو اللغة الإنجليزية.
+أجب بواحد فقط من هذه الرموز، بدون أي نص إضافي :
 
-أجب بواحد فقط من هذه الرموز الثلاثة، بدون أي نص إضافي :
+[conversation] ← اختر هذا لكل ما يلي :
+  • تحيات : bonjour, bonsoir, merci, salut, salam, مرحبا, شكرا, لاباس, كيداير, واش راك,
+    صباح الخير, comment ça va, ça va, qui es-tu, شكون نتا, أشنو عندك
+    (تنبيه: "نتا/نتي" بالدارجة المغربية = "أنت" ← دائماً [conversation])
+  • أسئلة عن هوية البوت أو قدراته
+  • أسئلة عامة لا علاقة لها بالقرآن أو الحديث
+    (téléphone, internet, ordinateur, clonage, météo, sport...)
+  • أسئلة مستحيلة (سورة 115, آية 9999, هل استخدم النبي الكمبيوتر؟)
+  • أسئلة معلوماتية إسلامية ذات إجابة ثابتة :
+    - كم عدد السور؟ / Combien de sourates? → [conversation]
+    - ما هي أركان الإسلام؟ / Quels sont les piliers de l'Islam? → [conversation]
+    - ما معنى كلمة X الإسلامية؟ → [conversation]
+    - ما عدد آيات القرآن؟ → [conversation]
 
-  [conversation] ← اختَر هذا في الحالات التالية :
-    • تحيات وإنهاء المحادثة : bonjour, merci, bonsoir, سلام, مرحبا, شكرا,
-      لاباس, كيداير, أشنو عندك, صباح الخير, واش راك ...
-    • أسئلة معلوماتية عامة لا تحتاج بحثاً في الآيات مثل :
-        - عدد السور (الجواب : 114)
-        - عدد الآيات
-        - أسماء الأنبياء
-        - تعريف مصطلح إسلامي بسيط
-    • أي رسالة غير دينية أو غير واضحة
+[hadith] ← سؤال يطلب حديثاً نبوياً أو كلام النبي ﷺ، مثل :
+  • hadith sur X / حديث عن X / ما قاله النبي عن X
+  • Que dit le Prophète sur... / Parle-moi d'un hadith...
+  • ما روي عن النبي في موضوع...
 
-  [quran]        ← سؤال عن آية أو سورة أو تفسير أو موضوع قرآني يحتاج بحثاً
-  [hadith]       ← سؤال عن حديث أو سنة أو فقه نبوي يحتاج بحثاً
+[quran] ← سؤال عن آية أو سورة أو موضوع قرآني يحتاج بحثاً في المصحف
+  • ما هي الآية التي... / اذكر السورة التي...
+  • Que dit le Coran sur... / Quel verset parle de...
+  • أي آية تأمر بـ... / ما معنى قوله تعالى...
 
 قاعدة : عند الشك بين [quran] و[hadith] → اختر [quran].
-لا تضف أي شرح أو علامة ترقيم إضافية."""
+قاعدة : أي رسالة لا تحتاج بحثاً في الآيات أو الأحاديث → [conversation].
+لا تضف أي شرح. أجب بالرمز فقط."""
 
 
 def route_question(question: str) -> str:
-    """Retourne 'conversation', 'quran' ou 'hadith'."""
     llm = ChatOllama(model="qwen3:8b", temperature=0)
     response = llm.invoke([
         SystemMessage(content=_SUPERVISOR_PROMPT),
